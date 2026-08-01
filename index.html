@@ -5286,9 +5286,15 @@ const Dash = {
     // 3. Fuel position
     try{
       const av=Prod._fuelAvailable?Prod._fuelAvailable():null;
-      if(av!==null && av<=0) items.push({pri:av<0?'critical':'warning',kind:'Fuel',
-        msg:av<0?('Negative fuel balance — '+av.toFixed(1)+' L'):'No fuel on hand',
-        meta:'Check for an uncaptured delivery'});
+      if(av!==null && av<=0){
+        const everRec=(Prod._fuelLedger()||[]).some(r=>r.type==='Receipt');
+        items.push({pri:av<0?'critical':(everRec?'warning':'info'),kind:'Fuel',
+          msg: av<0 ? ('Negative fuel balance — '+av.toFixed(1)+' L')
+             : everRec ? 'No fuel on hand — all received fuel has been issued'
+             : 'No fuel deliveries recorded yet',
+          meta: everRec ? 'Stores → Fuel Stock → Receive Delivery'
+                        : 'Fuel enters stock via Stores → Fuel Stock → 2 · Receive Delivery'});
+      }
     }catch(e){}
 
     // 4. Transfers awaiting action
@@ -10791,8 +10797,10 @@ const Prod = {
           const lvlCol = current<=0?'var(--red)':(daysCover!==null&&daysCover<=3)?'var(--red)'
                         :(daysCover!==null&&daysCover<=7)?'var(--orange)':'var(--green)';
           let warn=null;
-          if(current<0) warn='🚫 NEGATIVE STOCK — more fuel has been issued than received. Check for a missing delivery or a duplicated issue.';
-          else if(current===0) warn='🚫 NO FUEL ON HAND — request a delivery.';
+          const _everReceived=ledger.some(r=>r.type==='Receipt');
+          if(current<0) warn='🚫 NEGATIVE STOCK — more fuel has been issued than received. A delivery has probably not been captured: use <b>2 · Receive Delivery</b> above.';
+          else if(current===0 && !_everReceived) warn='⛽ NO DELIVERIES RECORDED YET — fuel only enters stock through <b>2 · Receive Delivery</b>. Record your deliveries and the balance will build up.';
+          else if(current===0) warn='🚫 NO FUEL ON HAND — all received fuel has been issued. Request and receive a delivery.';
           else if(daysCover!==null&&daysCover<=3) warn='⚠️ About '+daysCover+' day(s) of cover left at the current burn rate.';
           else if(daysCover!==null&&daysCover<=7) warn='⚠️ About '+daysCover+' days of cover left — plan the next delivery.';
           const lastRecon=recons.slice().sort((a,b)=>String(b.dateTo||'').localeCompare(String(a.dateTo||'')))[0];
@@ -10805,11 +10813,29 @@ const Prod = {
           const mKeys=Object.keys(months).sort().slice(-4);
           return `
           <!-- Action bar -->
-          <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px">
-            <button class="btn amber sm" id="btn-fuel-recon">📊 Fuel Reconciliation</button>
-            <button class="btn ghost sm" id="btn-fuel-request">📋 Request Fuel</button>
-            <button class="btn ghost sm" onclick="Prod._fuelLedgerPrint()">📒 Stock Ledger</button>
-          </div>
+          <!-- The fuel cycle. It does not end at the count: the count accounts for what was
+               used and tells you what to request next, which starts it again. -->
+          ${(()=>{
+            const step=(n,icon,label,attr,cls)=>
+              '<button class="btn '+(cls||'ghost')+' sm" '+attr+' style="white-space:nowrap">'
+              +'<b style="opacity:.6">'+n+'</b> '+icon+' '+label+'</button>'
+              +'<span style="color:var(--text3);font-size:15px;align-self:center;user-select:none">\u2192</span>';
+            return '<div style="display:flex;gap:6px;flex-wrap:wrap;align-items:center;margin-bottom:6px">'
+              +step('1','\u{1F4CB}','Request','id="btn-fuel-request"')
+              +(Prod._canReceiveFuel()
+                 ? step('2','\u26FD','Receive','onclick="Prod._fuelReceive()"','amber')
+                 : '<button class="btn ghost sm" disabled title="Stores or Site Admin receive deliveries" style="white-space:nowrap;opacity:.5"><b style="opacity:.6">2</b> \u26FD Receive</button>'
+                   +'<span style="color:var(--text3);font-size:15px;align-self:center">\u2192</span>')
+              +step('3','\u{1F69C}','Issue to plant','onclick="Prod.subTab(\'inn-fuel\')"')
+              +'<button class="btn ghost sm" id="btn-fuel-recon" style="white-space:nowrap"><b style="opacity:.6">4</b> \u{1F4CA} Account &amp; Count</button>'
+              +'<span style="color:var(--amber);font-size:14px;align-self:center;user-select:none" '
+                +'title="The count closes the loop: it accounts for what was used and sets what to request next">\u21BA</span>'
+              +'<button class="btn ghost sm" onclick="Prod._fuelLedgerPrint()" style="margin-left:auto;white-space:nowrap">\u{1F4D2} Stock Ledger</button>'
+            +'</div>'
+            +'<div style="font-size:10.5px;color:var(--text3);margin-bottom:12px;line-height:1.55">'
+            +'A closed loop \u2014 the count at step 4 accounts for everything issued since the last one, '
+            +'and the shortfall it leaves is what you request at step 1.</div>';
+          })()}
 
           ${Prod._myFuelRequestsCard()}
 
@@ -11175,6 +11201,171 @@ const Prod = {
       const s=String(rec.activityStart).split(':').map(Number), e=String(rec.activityEnd).split(':').map(Number);
       return Math.max(0,(e[0]*60+(e[1]||0))-(s[0]*60+(s[1]||0)))/60;})():0;
     return parseFloat(String(rec.hrsWorked||0))||clock||parseFloat(String(rec.activityHrs||0))||0;
+  },
+
+  // ══════════════════════════════════════════════════════════════════
+  //  RECEIVE FUEL — the step that was missing entirely.
+  //  Nothing in the app could add fuel to stock, so the balance could only
+  //  ever fall. A delivery may come against a request/PO or be bought
+  //  directly; both are handled here.
+  // ══════════════════════════════════════════════════════════════════
+  // After a stock count — carry the result straight into the next request.
+  _fuelCycleNext(rc){
+    try{
+      const onHand=parseFloat(rc&&rc.carriedForward);
+      const used=parseFloat(rc&&rc.consumed)||0;
+      const from=(rc&&rc.dateFrom)||'', to=(rc&&rc.dateTo)||'';
+      let days=0;
+      try{ const a=new Date(from+'T00:00:00'), b=new Date(to+'T00:00:00');
+           days=Math.max(1,Math.round((b-a)/86400000)||1); }catch(_){ days=1; }
+      const perDay=used>0?used/days:0;
+      const cover=(perDay>0&&isFinite(onHand))?Math.floor(onHand/perDay):null;
+      const body='<div style="font-size:12.5px;line-height:1.8">'
+        +'The count is recorded. It also tells you what to order next \u2014 that is what closes the loop.'
+        +'<div style="margin:12px 0;padding:11px 13px;background:var(--surface2);border-radius:8px;font-size:12px">'
+          +'Used over this period: <b>'+used.toLocaleString('en-ZA',{minimumFractionDigits:2,maximumFractionDigits:2})+' L</b>'
+          +(days>1?(' across '+days+' days'):'')
+          +(perDay>0?('<br>Burn rate: <b>'+perDay.toFixed(1)+' L/day</b>'):'')
+          +(isFinite(onHand)?('<br>On hand after the count: <b style="color:var(--green)">'
+              +onHand.toLocaleString('en-ZA',{minimumFractionDigits:2,maximumFractionDigits:2})+' L</b>'):'')
+          +(cover!==null?('<br>That is about <b style="color:'+(cover<=7?'var(--orange)':'var(--green)')
+              +'">'+cover+' day'+(cover===1?'':'s')+'</b> of cover at the current rate.'):'')
+        +'</div>'
+        +(cover!==null&&cover<=14
+          ? '<span style="color:var(--orange)">Worth raising a request now \u2014 fuel usually takes days to arrive.</span>'
+          : 'Raise a request whenever cover gets short.')
+        +'</div>';
+      Modal.open('\u21BA Next in the cycle \u2014 Request Fuel', body, [
+        {label:'\u{1F4CB} Request fuel now', cls:'amber', fn:()=>{ Modal.close();
+          setTimeout(()=>{ const b=ge('btn-fuel-request'); if(b) b.click(); },120); }},
+        {label:'Not now', cls:'ghost', fn:Modal.close.bind(Modal)}
+      ]);
+    }catch(e){}
+  },
+
+  _canReceiveFuel(){
+    const r=String((S.user&&S.user.role)||'');
+    return /stores|site.?admin|admin/i.test(r);      // storeman, stores assistant, site admin
+  },
+  _fuelReceive(requestId){
+    const esc=v=>String(v==null?'':v).replace(/[<>&"]/g,c=>({'<':'&lt;','>':'&gt;','&':'&amp;','"':'&quot;'}[c]));
+    if(!this._canReceiveFuel()){ toast('Only stores or site admin can receive a delivery','err'); return; }
+    const reqs=(DB.get('fuelRequests',S.project)||[])
+      .filter(r=>!(parseFloat(r.qtyReceived)>0))                    // still outstanding
+      .sort((a,b)=>String(b.dateRequested||'').localeCompare(String(a.dateRequested||'')));
+    const sel=requestId?reqs.find(r=>r.id===requestId):null;
+    const sups=[...new Set((DB.get('suppliers',S.project)||[]).map(x=>x.name).filter(Boolean))];
+    const body='<div style="font-size:11.5px;color:var(--text2);line-height:1.65;margin-bottom:12px;'
+        +'padding:10px 12px;background:var(--surface2);border-radius:7px">'
+        +'Record fuel <b>arriving on site</b>. This is what puts fuel into stock \u2014 until a delivery is '
+        +'received here, the store has nothing to issue from.'
+        +'<br><br>Link it to a request if one was raised, or leave that blank for fuel bought directly.</div>'
+      +'<div class="form-grid cols-2">'
+      +'<div class="field full"><label class="flabel">Against a request / PO '
+        +'<span style="font-size:10px;color:var(--text3);font-weight:400">\u2014 leave blank for a direct purchase</span></label>'
+        +'<select class="finput" id="frd-req" style="background:var(--surface2);color:var(--text)" onchange="Prod._fuelRecvPick()">'
+        +'<option value="">\u2014 direct purchase, no request \u2014</option>'
+        +reqs.map(r=>'<option value="'+esc(r.id)+'"'+(sel&&sel.id===r.id?' selected':'')+'>'
+          +(r.poNumber?('PO '+esc(r.poNumber)+' \u00b7 '):'')
+          +esc(r.supplierName||'supplier not set')+' \u00b7 '
+          +(parseFloat(r.qtyRequested)||0).toFixed(2)+' L requested \u00b7 '+esc(r.status||'')+'</option>').join('')
+        +'</select></div>'
+      +'<div class="field"><label class="flabel">Date Received <span style="color:var(--red)">*</span></label>'
+        +'<input class="finput" id="frd-date" type="date" value="'+todayISO()+'"></div>'
+      +'<div class="field"><label class="flabel">Delivery Note / Invoice No</label>'
+        +'<input class="finput" id="frd-dn" placeholder="e.g. DN-4521"></div>'
+      +'<div class="field"><label class="flabel">Supplier <span style="color:var(--red)">*</span></label>'
+        +'<input class="finput" id="frd-sup" list="frd-sup-list" placeholder="Supplier name">'
+        +'<datalist id="frd-sup-list">'+sups.map(x=>'<option value="'+esc(x)+'">').join('')+'</datalist></div>'
+      +'<div class="field"><label class="flabel">PO Number</label>'
+        +'<input class="finput" id="frd-po" placeholder="if applicable"></div>'
+      +'<div class="field"><label class="flabel">Litres Received <span style="color:var(--red)">*</span></label>'
+        +'<input class="finput" id="frd-qty" type="number" step="any" placeholder="0.00" '
+        +'style="text-align:right;font-weight:700;font-size:16px;color:var(--green)" oninput="Prod._fuelRecvCalc()"></div>'
+      +'<div class="field"><label class="flabel">Rate (E / litre)</label>'
+        +'<input class="finput" id="frd-rate" type="number" step="any" placeholder="0.00" '
+        +'style="text-align:right" oninput="Prod._fuelRecvCalc()"></div>'
+      +'<div class="field full"><div id="frd-total" style="font-size:12px;color:var(--text3);padding:2px 0"></div></div>'
+      +'<div class="field"><label class="flabel">Received By <span style="color:var(--red)">*</span></label>'
+        +'<input class="finput" id="frd-by" value="'+esc((S.user&&(S.user.name||S.user.username))||'')+'"></div>'
+      +'<div class="field"><label class="flabel">Tank reading after delivery '
+        +'<span style="font-size:10px;color:var(--text3);font-weight:400">(optional)</span></label>'
+        +'<input class="finput" id="frd-dip" type="number" step="any" placeholder="litres in tank"></div>'
+      +'<div class="field full"><label class="flabel">Notes</label>'
+        +'<textarea class="ftextarea" id="frd-notes" rows="2" placeholder="Short delivery, quality issue, driver name…"></textarea></div>'
+      +'</div>'
+      +'<div id="frd-check" style="margin-top:10px"></div>';
+    Modal.open('\u26FD Receive Fuel Delivery', body, [
+      {label:'Record delivery', cls:'amber', fn:()=>Prod._fuelRecvSave()},
+      {label:'Cancel', cls:'ghost', fn:Modal.close.bind(Modal)}
+    ], {wide:true});
+    setTimeout(()=>{ Prod._fuelRecvPick(); },40);
+  },
+  _fuelRecvPick(){
+    const id=(ge('frd-req')||{}).value||'';
+    const r=(DB.get('fuelRequests',S.project)||[]).find(x=>x.id===id);
+    const chk=ge('frd-check');
+    if(!r){ if(chk) chk.innerHTML=''; this._fuelRecvCalc(); return; }
+    if(ge('frd-sup')&&!ge('frd-sup').value) ge('frd-sup').value=r.supplierName||'';
+    if(ge('frd-po') &&!ge('frd-po').value)  ge('frd-po').value =r.poNumber||'';
+    if(ge('frd-rate')&&!ge('frd-rate').value&&r.rate) ge('frd-rate').value=r.rate;
+    if(ge('frd-qty')&&!ge('frd-qty').value&&r.qtyRequested) ge('frd-qty').value=r.qtyRequested;
+    this._fuelRecvCalc();
+  },
+  _fuelRecvCalc(){
+    const q=parseFloat((ge('frd-qty')||{}).value)||0;
+    const rt=parseFloat((ge('frd-rate')||{}).value)||0;
+    const t=ge('frd-total');
+    if(t) t.innerHTML = (q&&rt)
+      ? ('Delivery value: <b style="color:var(--green)">E '+(q*rt).toLocaleString('en-ZA',{minimumFractionDigits:2,maximumFractionDigits:2})+'</b>')
+      : '';
+    // Short delivery against a request is worth flagging at the point of receipt.
+    const id=(ge('frd-req')||{}).value||'';
+    const r=(DB.get('fuelRequests',S.project)||[]).find(x=>x.id===id);
+    const chk=ge('frd-check'); if(!chk) return;
+    if(!r||!q){ chk.innerHTML=''; return; }
+    const want=parseFloat(r.qtyRequested)||0;
+    const d=+(q-want).toFixed(2);
+    chk.innerHTML = Math.abs(d)<0.005 ? ''
+      : '<div style="padding:9px 12px;border-radius:7px;font-size:11.5px;line-height:1.55;border:1px solid '
+        +(d<0?'var(--orange)':'var(--blue)')+';background:'+(d<0?'rgba(249,115,22,.08)':'rgba(37,99,235,.08)')+';color:'
+        +(d<0?'var(--orange)':'var(--blue)')+'">'
+        +(d<0?('\u26a0 Short delivery \u2014 '+Math.abs(d).toFixed(2)+' L less than the '+want.toFixed(2)+' L requested. '
+               +'Record it as received; the shortfall stays visible against the request.')
+             :('Over-delivery \u2014 '+d.toFixed(2)+' L more than the '+want.toFixed(2)+' L requested.'))
+        +'</div>';
+  },
+  _fuelRecvSave(){
+    const gv=x=>{const el=ge(x);return el?String(el.value||'').trim():'';};
+    const qty=parseFloat(gv('frd-qty'))||0;
+    if(!gv('frd-date')){ toast('Enter the date received','err'); return; }
+    if(!gv('frd-sup')){  toast('Enter the supplier','err'); return; }
+    if(!(qty>0)){       toast('Enter the litres received','err'); return; }
+    if(!gv('frd-by')){   toast('Enter who received it','err'); return; }
+    const rate=parseFloat(gv('frd-rate'))||0;
+    const now=new Date().toISOString();
+    const reqId=gv('frd-req');
+    const existing=reqId?(DB.get('fuelRequests',S.project)||[]).find(x=>x.id===reqId):null;
+    // A direct purchase creates its own record, so every receipt lives in one place.
+    const rec=Object.assign({}, existing||{}, {
+      id: existing?existing.id:('FQ-'+uid()),
+      orgId:_orgId(), project:S.project,
+      dateRequested: (existing&&existing.dateRequested)||gv('frd-date'),
+      qtyRequested:  (existing&&existing.qtyRequested)||qty,
+      supplierName:  gv('frd-sup'), poNumber:gv('frd-po'),
+      rate: rate||((existing&&existing.rate)||0),
+      dateReceived:  gv('frd-date'), qtyReceived:qty,
+      docRef: gv('frd-dn'), status:'Received',
+      notes: [ (existing&&existing.notes)||'', gv('frd-notes'),
+               gv('frd-dip')?('Tank after delivery: '+gv('frd-dip')+' L'):'',
+               'Received by '+gv('frd-by')+(existing?'':' (direct purchase)') ]
+             .filter(Boolean).join(' \u00b7 '),
+      createdBy:(existing&&existing.createdBy)||((S.user&&S.user.id)||'')
+    });
+    DB.save('fuelRequests', rec);
+    Modal.close();
+    toast(qty.toFixed(2)+' L received \u2014 fuel stock updated \u2705','ok');
+    try{ this.renderStores(); }catch(e){}
   },
 
   _fuelLedger(){
@@ -11728,7 +11919,11 @@ const Prod = {
         }
       }
       Prod._reconAttach=null;
-      Modal.close(); toast('Reconciliation saved ✅','ok'); this.renderStores();
+      Modal.close(); toast('Stock count saved ✅','ok'); this.renderStores();
+      // Close the loop: the count has accounted for what was used, so the natural next
+      // step is requesting what the site now needs. Offer it rather than leaving the
+      // user to remember which tab to open.
+      setTimeout(()=>Prod._fuelCycleNext(rec),350);
     }},{label:'Cancel',cls:'ghost',fn:Modal.close.bind(Modal)}]);
     // Populate line items + auto-calc on open
     setTimeout(()=>{
